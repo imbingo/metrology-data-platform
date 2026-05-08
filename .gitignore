@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Runtime databases and local state
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Local environment
+.env
+.venv/
+venv/
+
+# Temporary files
+*.tmp
+~$*
