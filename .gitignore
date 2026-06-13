@@ -18,3 +18,10 @@ venv/
 *.tmp
 ~$*
 template_upload_cache/
+
+# Local generated workbooks and exports
+result_*.xlsx
+*_result*.xlsx
+*_results*.xlsx
+outputs/
+exports/
