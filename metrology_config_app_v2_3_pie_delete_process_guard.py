@@ -58,6 +58,10 @@ HOST = os.environ.get("MDCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MDCP_PORT", "8023"))
 SESSIONS = {}
 SCHEDULER_STOP = threading.Event()
+# Items whose real collection is currently running (possibly blocked on a slow/dead
+# network path). Used to avoid piling up duplicate reads and exhausting the read pool.
+INFLIGHT_LOCK = threading.Lock()
+INFLIGHT_ITEMS = set()
 APP_TZ = timezone(timedelta(hours=8))  # Asia/Shanghai / Asia/Singapore, UTC+8
 READ_TIMEOUT_SECONDS = int(os.environ.get("MDCP_READ_TIMEOUT_SECONDS", "20"))
 READ_RETRY_COUNT = int(os.environ.get("MDCP_READ_RETRY_COUNT", "3"))
@@ -66,6 +70,9 @@ FILE_STABLE_WAIT_SECONDS = float(os.environ.get("MDCP_FILE_STABLE_WAIT_SECONDS",
 READ_EXECUTOR = ThreadPoolExecutor(max_workers=int(os.environ.get("MDCP_READ_WORKERS", "4")))
 DISPLAY_IP = os.environ.get("MDCP_DISPLAY_IP", "10.21.210.75")
 TEMPLATE_CACHE_DIR = Path(os.environ.get("MDCP_TEMPLATE_CACHE_DIR", "template_upload_cache"))
+# Default UNC path shown in the new-item form. Kept as a module constant because an
+# f-string expression cannot contain a backslash on Python < 3.12 (PEP 701).
+DEFAULT_DATA_SOURCE_PATH_EXAMPLE = r"\\192.168.1.100\share\result.xlsx"
 
 
 # ==========================================================
@@ -946,6 +953,11 @@ def _write_timeout_log(item_id: int, dry_run: bool, message: str):
         print("[timeout_log_failed]", ex)
 
 
+def _clear_inflight(item_id: int):
+    with INFLIGHT_LOCK:
+        INFLIGHT_ITEMS.discard(item_id)
+
+
 def collect_item_with_timeout(item_id: int, dry_run=False):
     """Protect UI requests from hanging on slow/broken UNC paths.
 
@@ -953,8 +965,38 @@ def collect_item_with_timeout(item_id: int, dry_run=False):
     This returns control to the UI after READ_TIMEOUT_SECONDS; the underlying read may
     finish later. For strict industrial isolation, move collectors into separate worker
     processes/services.
+
+    Because a hung read keeps occupying a pool worker until the OS call returns, we guard
+    real (non-dry-run) collections with an in-flight set: while a previous read for the
+    same item is still blocked, we skip submitting another one. This keeps a single dead
+    path from accumulating duplicate jobs and exhausting READ_EXECUTOR, which would
+    otherwise stall collection for every item.
     """
-    future = READ_EXECUTOR.submit(collect_item, item_id, dry_run)
+    if not dry_run:
+        with INFLIGHT_LOCK:
+            if item_id in INFLIGHT_ITEMS:
+                return {
+                    "ok": False,
+                    "status": "READ_IN_PROGRESS",
+                    "message": "上一次采集仍在进行中（数据源路径可能无响应），本次已跳过，避免读取任务堆积、占满采集线程池。",
+                    "matched_rows": 0,
+                    "inserted": 0,
+                    "skipped": 0
+                }
+            INFLIGHT_ITEMS.add(item_id)
+
+    try:
+        future = READ_EXECUTOR.submit(collect_item, item_id, dry_run)
+    except Exception:
+        if not dry_run:
+            _clear_inflight(item_id)
+        raise
+
+    if not dry_run:
+        # Clear the in-flight flag only when the underlying read truly finishes, even if
+        # we already stopped waiting for it below after the timeout.
+        future.add_done_callback(lambda _f: _clear_inflight(item_id))
+
     try:
         return future.result(timeout=READ_TIMEOUT_SECONDS)
     except FutureTimeoutError:
@@ -1566,7 +1608,7 @@ def page_item_form(user, item_id=None, production_id=None, error=""):
           <label>量测执行时间</label><input name="execution_time_text" value="{h(item['execution_time_text'] if item else '')}" placeholder="例如 光刻后 / 每日10:00 / 工序完成后">
           <label>量测设备</label><input name="equipment_name" value="{h(item['equipment_name'] if item else '')}" placeholder="例如 CDSEM01">
           <label>数据源类型</label><select name="data_source_type"><option value="auto" {'selected' if (item and 'data_source_type' in item.keys() and item['data_source_type']=='auto') or not item else ''}>自动判断</option><option value="csv" {'selected' if item and 'data_source_type' in item.keys() and item['data_source_type']=='csv' else ''}>CSV</option><option value="excel" {'selected' if item and 'data_source_type' in item.keys() and item['data_source_type']=='excel' else ''}>Excel xlsx/xlsm</option></select>
-          <label>数据源路径 *</label><input name="data_source_path" value="{h(item['data_source_path'] if item else r'\\192.168.1.100\share\result.xlsx')}" required style="min-width:520px">
+          <label>数据源路径 *</label><input name="data_source_path" value="{h(item['data_source_path'] if item else DEFAULT_DATA_SOURCE_PATH_EXAMPLE)}" required style="min-width:520px">
           <label>Excel Sheet 名称</label><input name="excel_sheet_name" value="{h(item['excel_sheet_name'] if item and 'excel_sheet_name' in item.keys() else '')}" placeholder="Excel 多 Sheet 时填写，例如 Sheet1">
           <label>表头所在行</label><input name="header_row_index" value="{h(item['header_row_index'] if item and 'header_row_index' in item.keys() else 1)}" type="number" min="1">
           <label>CSV编码</label><select name="csv_encoding">
@@ -1717,7 +1759,7 @@ def page_results(user, query=None):
     conn = get_conn()
     rows = conn.execute(sql, params).fetchall()
     conn.close()
-    status_values = ["MS3_PASS", "MS2_PASS", "MISS_MS2", "PASS", "OOC", "OOS", "TEXT"]
+    status_values = ["MS3_PASS", "MS2_PASS", "MISS_MS2", "PASS", "TEXT"]
     status_options = "".join(f'<option value="{s}" {"selected" if result_status == s else ""}>{display_status(s)}</option>' for s in status_values)
     export_href = "/export_results_xlsx?" + urlencode({
         "production_code": production_code,
