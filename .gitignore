@@ -25,3 +25,10 @@ result_*.xlsx
 *_results*.xlsx
 outputs/
 exports/
+
+# Local build caches
+build_pyinstaller/
+release_staging/
+dist_exe/
+offline_ocr_bundle/
+.env.ocr.ps1

@@ -31,12 +31,14 @@
 """
 
 import csv
+import glob
 import hashlib
 import html
 import io
 import json
 import math
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -51,8 +53,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
-APP_VERSION = "V2.3"
-APP_TITLE = "量测数据采集配置平台 V2.3 - 饼图看板与结果删除增强版"
+APP_VERSION = "V2.4"
+APP_TITLE = "量测数据采集配置平台 V2.4 - 图片 OCR 数据源增强版"
 DB_FILE = "metrology_config_v1.db"
 HOST = os.environ.get("MDCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("MDCP_PORT", "8023"))
@@ -73,6 +75,22 @@ TEMPLATE_CACHE_DIR = Path(os.environ.get("MDCP_TEMPLATE_CACHE_DIR", "template_up
 # Default UNC path shown in the new-item form. Kept as a module constant because an
 # f-string expression cannot contain a backslash on Python < 3.12 (PEP 701).
 DEFAULT_DATA_SOURCE_PATH_EXAMPLE = r"\\192.168.1.100\share\result.xlsx"
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+DEFAULT_IMAGE_PARSE_CONFIG_JSON = json.dumps({
+    "file_pattern": "*",
+    "process_from_filename_regex": "",
+    "ocr": {
+        "lang": "eng",
+        "psm": 6,
+        "scale": 2.0,
+        "threshold": True
+    },
+    "metrics": {
+        "Rx": {"roi": [0.05, 0.10, 0.30, 0.12], "regex": r"Rx\s*[:=]?\s*([-+]?\d+(?:\.\d+)?)"},
+        "Ry": {"roi": [0.05, 0.24, 0.30, 0.12], "regex": r"Ry\s*[:=]?\s*([-+]?\d+(?:\.\d+)?)"},
+        "Z": {"roi": [0.05, 0.38, 0.30, 0.12], "regex": r"Z\s*[:=]?\s*([-+]?\d+(?:\.\d+)?)"}
+    }
+}, ensure_ascii=False, indent=2)
 
 
 # ==========================================================
@@ -198,6 +216,7 @@ def init_db():
         data_source_type TEXT DEFAULT 'auto',
         data_source_path TEXT,
         excel_sheet_name TEXT,
+        image_parse_config_json TEXT,
         header_row_index INTEGER DEFAULT 1,
         csv_encoding TEXT DEFAULT 'auto',
         delimiter TEXT DEFAULT ',',
@@ -346,6 +365,7 @@ def init_db():
 
     ensure_column(cur, "measurement_item_config", "data_source_type", "data_source_type TEXT DEFAULT 'auto'")
     ensure_column(cur, "measurement_item_config", "excel_sheet_name", "excel_sheet_name TEXT")
+    ensure_column(cur, "measurement_item_config", "image_parse_config_json", "image_parse_config_json TEXT")
     ensure_column(cur, "measurement_item_config", "header_row_index", "header_row_index INTEGER DEFAULT 1")
     ensure_column(cur, "measurement_item_config", "process_step_column", "process_step_column TEXT")
     ensure_column(cur, "template_config", "excel_sheet_name", "excel_sheet_name TEXT")
@@ -594,13 +614,212 @@ def read_xlsx_rows(path: str, sheet_name: str = "", header_row_index: int = 1):
     return _rows_matrix_to_dicts(parsed_rows, selected_name, header_row_index, preview_limit=None)
 
 
-def read_source_rows(data_source_type: str, path: str, encoding: str, delimiter: str, sheet_name: str = "", header_row_index: int = 1):
+def is_image_path(path: str) -> bool:
+    return Path(path or "").suffix.lower() in IMAGE_SUFFIXES
+
+
+def has_glob_pattern(path: str) -> bool:
+    return any(ch in (path or "") for ch in "*?[")
+
+
+def normalize_image_roi(roi, metric_name=""):
+    if isinstance(roi, dict):
+        values = [roi.get("x"), roi.get("y"), roi.get("w", roi.get("width")), roi.get("h", roi.get("height"))]
+    elif isinstance(roi, (list, tuple)) and len(roi) == 4:
+        values = list(roi)
+    else:
+        raise ValueError(f"Image OCR metric {metric_name} missing valid roi [x,y,w,h].")
+    try:
+        x, y, w, hgt = [float(v) for v in values]
+    except Exception as ex:
+        raise ValueError(f"Image OCR metric {metric_name} roi must contain numbers.") from ex
+    if x < 0 or y < 0 or w <= 0 or hgt <= 0 or x + w > 1.000001 or y + hgt > 1.000001:
+        raise ValueError(f"Image OCR metric {metric_name} roi must be normalized inside 0..1.")
+    return [x, y, w, hgt]
+
+
+def parse_image_parse_config(config_json: str, required_metric_columns=None):
+    if not str(config_json or "").strip():
+        raise ValueError("Image OCR config JSON is required.")
+    try:
+        config = json.loads(config_json)
+    except json.JSONDecodeError as ex:
+        raise ValueError(f"Invalid Image OCR config JSON: {ex}") from ex
+    if not isinstance(config, dict):
+        raise ValueError("Image OCR config JSON must be an object.")
+    metric_configs = config.get("metrics")
+    if not isinstance(metric_configs, dict) or not metric_configs:
+        raise ValueError("Image OCR config JSON must include a non-empty metrics object.")
+    required = [str(c).strip() for c in (required_metric_columns or metric_configs.keys()) if str(c).strip()]
+    for metric_name in required:
+        metric_cfg = metric_configs.get(metric_name)
+        if not isinstance(metric_cfg, dict):
+            raise ValueError(f"Image OCR config missing metric config for {metric_name}.")
+        if "roi" not in metric_cfg:
+            raise ValueError(f"Image OCR metric {metric_name} missing roi.")
+        normalize_image_roi(metric_cfg.get("roi"), metric_name)
+        if not str(metric_cfg.get("regex") or "").strip():
+            raise ValueError(f"Image OCR metric {metric_name} missing regex.")
+    return config
+
+
+def find_stable_image_file(path: str, config: dict):
+    if not path:
+        raise FileNotFoundError("Image source path is empty.")
+    source = Path(path)
+    if source.is_dir():
+        pattern = str(config.get("file_pattern") or "*")
+        candidates = list(source.glob(pattern))
+    elif has_glob_pattern(path):
+        candidates = [Path(p) for p in glob.glob(path, recursive=True)]
+    else:
+        candidates = [source]
+    candidates = [p for p in candidates if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES]
+    if not candidates:
+        raise FileNotFoundError(f"No supported image files found for path: {path}")
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    last_error = None
+    for candidate in candidates:
+        try:
+            data, stat_info = _read_file_bytes_stably(str(candidate))
+            return str(candidate), data, stat_info
+        except Exception as ex:
+            last_error = ex
+            continue
+    raise RuntimeError(f"No stable image file could be read from {path}: {last_error}")
+
+
+def preprocess_image_roi_for_ocr(image_bytes: bytes, roi, ocr_config: dict):
+    try:
+        from PIL import Image
+        import cv2
+        import numpy as np
+    except ImportError as ex:
+        raise RuntimeError("Image OCR requires Pillow, opencv-python-headless, numpy and pytesseract. Install requirements_ocr.txt.") from ex
+
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    width, height = image.size
+    x, y, w, hgt = normalize_image_roi(roi)
+    left = max(0, min(width - 1, int(round(x * width))))
+    top = max(0, min(height - 1, int(round(y * height))))
+    right = max(left + 1, min(width, int(round((x + w) * width))))
+    bottom = max(top + 1, min(height, int(round((y + hgt) * height))))
+    cropped = image.crop((left, top, right, bottom)).convert("L")
+    arr = np.array(cropped)
+    scale = float(ocr_config.get("scale", 2.0) or 1.0)
+    if scale != 1.0:
+        arr = cv2.resize(arr, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    if ocr_config.get("threshold", True):
+        arr = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    return Image.fromarray(arr), {"left": left, "top": top, "right": right, "bottom": bottom}
+
+
+def extract_regex_value(text: str, pattern: str, metric_name=""):
+    match = re.search(pattern, text or "", re.IGNORECASE | re.MULTILINE)
+    if not match:
+        raise ValueError(f"Image OCR text for {metric_name} did not match regex.")
+    if "value" in match.groupdict():
+        return match.group("value").strip()
+    if match.groups():
+        return match.group(1).strip()
+    return match.group(0).strip()
+
+
+def run_image_ocr(image_bytes: bytes, image_path: str, config: dict, required_metric_columns):
+    try:
+        import pytesseract
+    except ImportError as ex:
+        raise RuntimeError("Image OCR requires pytesseract. Install requirements_ocr.txt.") from ex
+    tesseract_cmd = os.environ.get("MDCP_TESSERACT_CMD", "").strip()
+    if tesseract_cmd:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
+    metric_configs = config.get("metrics") or {}
+    ocr_config = config.get("ocr") if isinstance(config.get("ocr"), dict) else {}
+    lang = str(ocr_config.get("lang") or "eng")
+    psm = safe_int(ocr_config.get("psm", 6), 6)
+    extra_config = str(ocr_config.get("config") or "").strip()
+    tesseract_config = f"--psm {psm}" + (f" {extra_config}" if extra_config else "")
+    values = {}
+    debug = {
+        "image_path": image_path,
+        "metrics": {}
+    }
+    for metric_name in required_metric_columns:
+        metric_cfg = metric_configs.get(metric_name)
+        processed_image, pixel_roi = preprocess_image_roi_for_ocr(image_bytes, metric_cfg["roi"], ocr_config)
+        raw_text = pytesseract.image_to_string(processed_image, lang=lang, config=tesseract_config)
+        value = extract_regex_value(raw_text, metric_cfg["regex"], metric_name)
+        values[metric_name] = value
+        debug["metrics"][metric_name] = {
+            "roi": metric_cfg["roi"],
+            "pixel_roi": pixel_roi,
+            "regex": metric_cfg["regex"],
+            "ocr_text": raw_text,
+            "value": value
+        }
+    return values, debug
+
+
+def extract_process_from_filename(image_path: str, config: dict):
+    pattern = (config.get("process_from_filename_regex") or config.get("filename_process_regex") or "").strip()
+    if not pattern:
+        return ""
+    target = Path(image_path).name
+    match = re.search(pattern, target)
+    if not match:
+        return ""
+    if "process_step" in match.groupdict():
+        return match.group("process_step").strip()
+    if match.groups():
+        return match.group(1).strip()
+    return match.group(0).strip()
+
+
+def read_image_rows(path: str, image_config_json: str, production_code: str, code_column: str,
+                    fixed_process_step: str, process_column: str, required_metric_columns):
+    required_metric_columns = [str(c).strip() for c in (required_metric_columns or []) if str(c).strip()]
+    config = parse_image_parse_config(image_config_json, required_metric_columns)
+    image_path, image_bytes, stat_info = find_stable_image_file(path, config)
+    values, debug = run_image_ocr(image_bytes, image_path, config, required_metric_columns)
+    code_field = code_column or "production_code"
+    row = {
+        code_field: production_code,
+        "_source_path": image_path,
+        "_source_mtime": datetime.fromtimestamp(stat_info.st_mtime, APP_TZ).isoformat(),
+        "_ocr": debug
+    }
+    if process_column:
+        row[process_column] = extract_process_from_filename(image_path, config) or fixed_process_step or ""
+    for metric_name in required_metric_columns:
+        row[metric_name] = values.get(metric_name, "")
+    fieldnames = [code_field]
+    if process_column:
+        fieldnames.append(process_column)
+    fieldnames.extend(required_metric_columns)
+    fieldnames.extend(["_source_path", "_source_mtime", "_ocr"])
+    return fieldnames, [row], f"image:{image_path}"
+
+
+def read_source_rows(data_source_type: str, path: str, encoding: str, delimiter: str, sheet_name: str = "", header_row_index: int = 1,
+                     image_config_json: str = "", production_code: str = "", code_column: str = "",
+                     fixed_process_step: str = "", process_column: str = "", required_metric_columns=None):
     source_type = (data_source_type or "auto").strip().lower()
     suffix = Path(path or "").suffix.lower()
     if source_type == "auto":
-        source_type = "excel" if suffix in (".xlsx", ".xlsm", ".xls") else "csv"
+        if suffix in (".xlsx", ".xlsm", ".xls"):
+            source_type = "excel"
+        elif suffix in IMAGE_SUFFIXES or (path and (Path(path).is_dir() or has_glob_pattern(path))):
+            source_type = "image"
+        else:
+            source_type = "csv"
     if source_type == "excel":
         return read_xlsx_rows(path, sheet_name, header_row_index)
+    if source_type == "image":
+        return read_image_rows(
+            path, image_config_json, production_code, code_column,
+            fixed_process_step, process_column, required_metric_columns or []
+        )
     return read_csv_rows(path, encoding, delimiter)
 
 
@@ -716,7 +935,13 @@ def collect_item(item_id: int, dry_run=False):
             item["csv_encoding"] or "auto",
             item["delimiter"] or ",",
             item["excel_sheet_name"] if "excel_sheet_name" in item.keys() else "",
-            item["header_row_index"] if "header_row_index" in item.keys() else 1
+            item["header_row_index"] if "header_row_index" in item.keys() else 1,
+            item["image_parse_config_json"] if "image_parse_config_json" in item.keys() else "",
+            production_code,
+            code_column,
+            fixed_process_step,
+            process_column,
+            [m["source_column"] for m in metrics]
         )
 
         if code_column not in fieldnames:
@@ -852,11 +1077,13 @@ def collect_item(item_id: int, dry_run=False):
                 "collect_rows": len(target_rows),
                 "blank_process_rows_skipped": blank_process_rows,
                 "metric_preview": preview,
-                "row_previews": preview_rows
+                "row_previews": preview_rows,
+                "image_ocr": [r.get("_ocr") for r in target_rows if isinstance(r, dict) and r.get("_ocr")]
             }
 
         for target_row in target_rows:
             base_hash = row_hash(target_row)
+            actual_source_path = target_row.get("_source_path") or data_source_path
             row_process_step = str(target_row.get(process_column, "")).strip() if process_column else ""
             effective_process_step = row_process_step or item["process_step"] or ""
             for m in metrics:
@@ -883,7 +1110,7 @@ def collect_item(item_id: int, dry_run=False):
                         effective_process_step, item["execution_time_text"], item["equipment_name"],
                         m["metric_name"], value_text, value_number, m["unit"],
                         m["target"], m["lsl"], m["usl"], m["lcl"], m["ucl"], status,
-                        data_source_path, base_hash, metric_hash, now_str(),
+                        actual_source_path, base_hash, metric_hash, now_str(),
                         json.dumps(target_row, ensure_ascii=False)
                     ))
                     inserted += 1
@@ -910,7 +1137,8 @@ def collect_item(item_id: int, dry_run=False):
             "process_step_column": process_column,
             "blank_process_rows_skipped": blank_process_rows,
             "metric_preview": preview,
-            "row_previews": preview_rows
+            "row_previews": preview_rows,
+            "image_ocr": [r.get("_ocr") for r in target_rows if isinstance(r, dict) and r.get("_ocr")]
         }
 
     except Exception as ex:
@@ -1594,6 +1822,7 @@ def page_item_form(user, item_id=None, production_id=None, error=""):
     if not prod:
         return base_layout("错误", "<h1>请先选择生产编号</h1>", user)
     title = "编辑量测项" if item else "新增量测项"
+    image_config_value = item["image_parse_config_json"] if item and "image_parse_config_json" in item.keys() and item["image_parse_config_json"] else DEFAULT_IMAGE_PARSE_CONFIG_JSON
     return base_layout(title, f"""
     <h1>{title}：{h(prod['production_code'])}</h1>
     <div class="card">
@@ -1607,10 +1836,11 @@ def page_item_form(user, item_id=None, production_id=None, error=""):
           <label>工序字段名</label><input name="process_step_column" value="{h(item['process_step_column'] if item and 'process_step_column' in item.keys() else '')}" placeholder="例如 贴装工序；留空则只采集生产编号最后一行">
           <label>量测执行时间</label><input name="execution_time_text" value="{h(item['execution_time_text'] if item else '')}" placeholder="例如 光刻后 / 每日10:00 / 工序完成后">
           <label>量测设备</label><input name="equipment_name" value="{h(item['equipment_name'] if item else '')}" placeholder="例如 CDSEM01">
-          <label>数据源类型</label><select name="data_source_type"><option value="auto" {'selected' if (item and 'data_source_type' in item.keys() and item['data_source_type']=='auto') or not item else ''}>自动判断</option><option value="csv" {'selected' if item and 'data_source_type' in item.keys() and item['data_source_type']=='csv' else ''}>CSV</option><option value="excel" {'selected' if item and 'data_source_type' in item.keys() and item['data_source_type']=='excel' else ''}>Excel xlsx/xlsm</option></select>
+          <label>数据源类型</label><select name="data_source_type"><option value="auto" {'selected' if (item and 'data_source_type' in item.keys() and item['data_source_type']=='auto') or not item else ''}>自动判断</option><option value="csv" {'selected' if item and 'data_source_type' in item.keys() and item['data_source_type']=='csv' else ''}>CSV</option><option value="excel" {'selected' if item and 'data_source_type' in item.keys() and item['data_source_type']=='excel' else ''}>Excel xlsx/xlsm</option><option value="image" {'selected' if item and 'data_source_type' in item.keys() and item['data_source_type']=='image' else ''}>Image OCR</option></select>
           <label>数据源路径 *</label><input name="data_source_path" value="{h(item['data_source_path'] if item else DEFAULT_DATA_SOURCE_PATH_EXAMPLE)}" required style="min-width:520px">
           <label>Excel Sheet 名称</label><input name="excel_sheet_name" value="{h(item['excel_sheet_name'] if item and 'excel_sheet_name' in item.keys() else '')}" placeholder="Excel 多 Sheet 时填写，例如 Sheet1">
           <label>表头所在行</label><input name="header_row_index" value="{h(item['header_row_index'] if item and 'header_row_index' in item.keys() else 1)}" type="number" min="1">
+          <label>Image OCR config JSON</label><textarea name="image_parse_config_json" rows="12" style="grid-column:1 / -1; font-family:Consolas,monospace">{h(image_config_value)}</textarea>
           <label>CSV编码</label><select name="csv_encoding">
   <option value="auto" {'selected' if (item and item['csv_encoding']=='auto') or not item else ''}>auto 自动识别</option>
   <option value="utf-8-sig" {'selected' if item and item['csv_encoding']=='utf-8-sig' else ''}>utf-8-sig</option>
@@ -1713,6 +1943,7 @@ def page_test_collect(user, item_id):
     <div class="card"><h2>识别到的字段</h2><pre>{h(json.dumps(result.get('fieldnames', []), ensure_ascii=False, indent=2))}</pre></div>
     <div class="card"><h2>匹配到的行数 / 采集行数</h2><pre>{h(json.dumps({'matched_rows': result.get('matched_rows'), 'collect_rows': result.get('collect_rows'), 'process_step_column': result.get('process_step_column'), 'metric_preview': result.get('metric_preview')}, ensure_ascii=False, indent=2))}</pre></div>
     <div class="card"><h2>多工序行预览</h2><pre>{h(json.dumps(result.get('row_previews', []), ensure_ascii=False, indent=2))}</pre></div>
+    <div class="card"><h2>Image OCR</h2><pre>{h(json.dumps(result.get('image_ocr', []), ensure_ascii=False, indent=2))}</pre></div>
     """
     return base_layout("测试读取", body, user)
 
@@ -2129,12 +2360,12 @@ def insert_config_payload(cur, cfg):
         cur.execute("""
         INSERT INTO measurement_item_config (
             production_id, item_name, process_step, process_step_column, execution_time_text, equipment_name,
-            data_source_type, data_source_path, excel_sheet_name, header_row_index, csv_encoding, delimiter, production_code_column,
+            data_source_type, data_source_path, excel_sheet_name, image_parse_config_json, header_row_index, csv_encoding, delimiter, production_code_column,
             scan_frequency_seconds, enabled, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             production_id, item.get("item_name"), item.get("process_step"), item.get("process_step_column", ""), item.get("execution_time_text"), item.get("equipment_name"),
-            item.get("data_source_type", "auto"), item.get("data_source_path"), item.get("excel_sheet_name"), item.get("header_row_index", 1), item.get("csv_encoding", "auto"), item.get("delimiter", ","), item.get("production_code_column", "生产编号"),
+            item.get("data_source_type", "auto"), item.get("data_source_path"), item.get("excel_sheet_name"), item.get("image_parse_config_json", ""), item.get("header_row_index", 1), item.get("csv_encoding", "auto"), item.get("delimiter", ","), item.get("production_code_column", "生产编号"),
             item.get("scan_frequency_seconds", 60), item.get("enabled", 1), now_str()
         ))
         item_id = cur.lastrowid
@@ -2761,6 +2992,7 @@ def page_about(user):
 PROD_A_V1,1.2,2.3,1.1,2.1,0.8
 PROD_B_V1,1.5,2.2,1.4,2.0,0.7</pre>
       <p>量测项中配置 <b>生产编号字段名=生产编号</b>，指标中配置 <b>Dx1、Dy1、Dx2、Dy2、Rz</b>，系统会读取当前生产编号对应行。</p>
+      <p class="note">V2.4 also supports Image OCR data sources for .png/.jpg/.jpeg/.bmp/.tif/.tiff. Configure ROI and regex in the measurement item to extract Rx/Ry/Z from fixed-layout equipment images.</p>
     </div>
     <div class="card">
       <h2>共享路径注意事项</h2>
@@ -2857,7 +3089,7 @@ class AppHandler(BaseHTTPRequestHandler):
         q = parse_qs(parsed.query)
 
         if path == "/version":
-            self.send_html("<h1>Metrology Config App V2.3</h1><p>PORT=8023</p><p>CSV/XLSX multi-sheet template wizard + pie dashboard + result delete + process-required collection guard</p>")
+            self.send_html("<h1>Metrology Config App V2.4</h1><p>PORT=8023</p><p>CSV/XLSX/Image OCR collection + multi-sheet template wizard + pie dashboard + result delete + process-required collection guard</p>")
             return
 
         if path == "/login":
@@ -3100,8 +3332,12 @@ class AppHandler(BaseHTTPRequestHandler):
         production_id = safe_int(form.get("production_id", [0])[0])
         process_step_value = form.get("process_step", [""])[0].strip()
         process_step_column_value = form.get("process_step_column", [""])[0].strip()
+        data_source_type_value = form.get("data_source_type", ["auto"])[0]
+        image_parse_config_value = form.get("image_parse_config_json", [""])[0].strip()
         if not process_step_value and not process_step_column_value:
             raise ValueError("量测项必须填写固定量测工序，或填写工序字段名；否则系统无法追溯数据属于哪道工序，且会禁止采集。")
+        if data_source_type_value == "image":
+            parse_image_parse_config(image_parse_config_value)
         vals = (
             production_id,
             form.get("item_name", [""])[0].strip(),
@@ -3109,9 +3345,10 @@ class AppHandler(BaseHTTPRequestHandler):
             process_step_column_value,
             form.get("execution_time_text", [""])[0].strip(),
             form.get("equipment_name", [""])[0].strip(),
-            form.get("data_source_type", ["auto"])[0],
+            data_source_type_value,
             form.get("data_source_path", [""])[0].strip(),
             form.get("excel_sheet_name", [""])[0].strip(),
+            image_parse_config_value,
             max(1, safe_int(form.get("header_row_index", [1])[0], 1)),
             form.get("csv_encoding", ["auto"])[0],
             form.get("delimiter", [","])[0],
@@ -3124,13 +3361,13 @@ class AppHandler(BaseHTTPRequestHandler):
         cur = conn.cursor()
         if item_id:
             cur.execute("""
-            UPDATE measurement_item_config SET production_id=?, item_name=?, process_step=?, process_step_column=?, execution_time_text=?, equipment_name=?, data_source_type=?, data_source_path=?, excel_sheet_name=?, header_row_index=?, csv_encoding=?, delimiter=?, production_code_column=?, scan_frequency_seconds=?, enabled=?, updated_at=? WHERE id=?
+            UPDATE measurement_item_config SET production_id=?, item_name=?, process_step=?, process_step_column=?, execution_time_text=?, equipment_name=?, data_source_type=?, data_source_path=?, excel_sheet_name=?, image_parse_config_json=?, header_row_index=?, csv_encoding=?, delimiter=?, production_code_column=?, scan_frequency_seconds=?, enabled=?, updated_at=? WHERE id=?
             """, vals + (safe_int(item_id),))
             new_id = safe_int(item_id)
         else:
             cur.execute("""
-            INSERT INTO measurement_item_config (production_id, item_name, process_step, process_step_column, execution_time_text, equipment_name, data_source_type, data_source_path, excel_sheet_name, header_row_index, csv_encoding, delimiter, production_code_column, scan_frequency_seconds, enabled, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO measurement_item_config (production_id, item_name, process_step, process_step_column, execution_time_text, equipment_name, data_source_type, data_source_path, excel_sheet_name, image_parse_config_json, header_row_index, csv_encoding, delimiter, production_code_column, scan_frequency_seconds, enabled, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, vals)
             new_id = cur.lastrowid
         conn.commit()
