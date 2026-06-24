@@ -65,6 +65,18 @@ $env:MDCP_TESSERACT_CMD="C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 EXE 包不要求产线电脑安装 Python；Python 运行时和 Python OCR 依赖已经打进 `metrology_data_platform_v2_4/` 目录。产线电脑首次运行时只需要安装或定位包内的 Tesseract-OCR。
 
+局域网访问前，可先在服务器电脑上测试 8023 端口是否能被其他电脑访问：
+
+```powershell
+.\test_8023_lan_port.ps1 -Mode Server -Port 8023
+```
+
+然后在另一台局域网电脑的浏览器中访问脚本显示的 `http://服务器IP:8023`。也可以在另一台电脑运行：
+
+```powershell
+.\test_8023_lan_port.ps1 -Mode Client -ServerIp 服务器IP -Port 8023
+```
+
 源码离线运行方式仍然保留。复制整个项目目录到产线电脑后，直接运行：
 
 ```powershell

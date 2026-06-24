@@ -7,6 +7,7 @@
 - `metrology_data_platform_v2_4/`: 已用 PyInstaller 打包好的 V2.4 程序，Python 运行时和 Python OCR 依赖已经包含在此目录。
 - `offline_ocr_bundle/tesseract_installer/`: Tesseract-OCR 离线安装程序。
 - `start_metrology_v2_4_exe.ps1`: 产线启动脚本，会先安装或定位 Tesseract，再启动平台并打开浏览器。
+- `test_8023_lan_port.ps1`: 局域网 8023 端口连通性测试脚本，不依赖平台主程序。
 
 ## 首次运行
 
@@ -50,6 +51,30 @@ $env:MDCP_TESSERACT_CMD="C:\Program Files\Tesseract-OCR\tesseract.exe"
 ```powershell
 .\start_metrology_v2_4_exe.ps1 -Port 8030
 ```
+
+## 局域网访问测试
+
+正式启动平台前，可以先用测试脚本确认公司电脑是否允许访问 8023 端口。
+
+在服务器电脑上运行：
+
+```powershell
+.\test_8023_lan_port.ps1 -Mode Server -Port 8023
+```
+
+脚本会显示本机可用的访问地址，例如：
+
+```text
+http://192.168.1.20:8023
+```
+
+在另一台局域网电脑上打开浏览器访问该地址；如果看到 `MDCP 8023 LAN PORT TEST OK`，说明端口连通。也可以把本包复制到另一台电脑后运行：
+
+```powershell
+.\test_8023_lan_port.ps1 -Mode Client -ServerIp 192.168.1.20 -Port 8023
+```
+
+如果连不上，需要让 IT 在服务器电脑上按公司安全策略放行 TCP 8023 入站访问，建议只放行指定内网网段或指定电脑 IP。
 
 ## 重要说明
 
