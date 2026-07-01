@@ -65,6 +65,8 @@ $env:MDCP_TESSERACT_CMD="C:\Program Files\Tesseract-OCR\tesseract.exe"
 metrology_login_launcher.exe
 ```
 
+该入口会打开独立桌面窗口，不会打开 Edge/Chrome 浏览器。它支持“本机启动服务”“局域网服务器模式”“连接已有服务器”三种方式。
+
 首次部署或需要安装 OCR 依赖时，运行：
 
 ```powershell

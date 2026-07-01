@@ -6,7 +6,7 @@
 
 - `metrology_data_platform_v2_4/`: 已用 PyInstaller 打包好的 V2.4 程序，Python 运行时和 Python OCR 依赖已经包含在此目录。
 - `offline_ocr_bundle/tesseract_installer/`: Tesseract-OCR 离线安装程序。
-- `metrology_login_launcher.exe`: 日常登录入口，双击后启动后台服务并打开登录页。
+- `metrology_login_launcher.exe`: 日常桌面登录入口，双击后启动后台服务或连接已有服务器，并在独立桌面窗口中打开平台。
 - `start_metrology_v2_4_exe.ps1`: 产线启动脚本，会先安装或定位 Tesseract，再启动平台并打开浏览器。
 - `test_8023_lan_port.ps1`: 局域网 8023 端口连通性测试脚本，不依赖平台主程序。
 
@@ -18,12 +18,15 @@
 metrology_login_launcher.exe
 ```
 
-启动器提供两种模式：
+启动器提供三种模式：
 
-- `仅本机使用`: 只允许服务器电脑本机访问。
-- `局域网服务器模式`: 允许局域网其他电脑访问，登录地址显示为 `http://服务器IP:8023`。
+- `本机启动服务`: 只在当前电脑启动平台服务，并在桌面窗口中登录。
+- `局域网服务器模式`: 在服务器电脑启动平台服务，允许局域网其他电脑访问，地址显示为 `http://服务器IP:8023`。
+- `连接已有服务器`: 不启动本机服务，直接连接已经部署好的服务器地址，例如 `192.168.1.20` 或 `http://192.168.1.20:8023`。
 
-点击 `启动并打开登录页` 后，会自动启动后台服务并打开登录页。
+点击 `打开桌面窗口` 后，会自动启动/连接平台，并在独立桌面窗口中显示登录页，不会打开 Edge 或 Chrome 浏览器窗口。
+
+桌面窗口使用 Microsoft Edge WebView2 Runtime 作为内嵌网页运行时。Windows 11 通常已自带；如果公司精简版 Windows 电脑缺少该运行时，启动器会提示 IT 先安装 Microsoft Edge WebView2 Evergreen Runtime。
 
 ## 首次运行/安装 OCR
 
