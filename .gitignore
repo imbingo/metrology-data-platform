@@ -34,3 +34,4 @@ dist_exe/
 dist_launcher/
 offline_ocr_bundle/
 .env.ocr.ps1
+metrology_launcher_config.json

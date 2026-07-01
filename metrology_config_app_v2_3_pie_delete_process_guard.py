@@ -2982,6 +2982,171 @@ def handle_template_apply(user, form, ip_address):
     return item_id
 
 
+def page_template_apply_bulk(user, production_id):
+    conn = get_conn()
+    prod = conn.execute("SELECT * FROM production_config WHERE id=?", (production_id,)).fetchone()
+    templates = conn.execute("""
+        SELECT t.*, COUNT(tm.id) AS metric_count
+        FROM template_config t
+        LEFT JOIN template_metric_config tm ON tm.template_id=t.id
+        GROUP BY t.id
+        ORDER BY t.id DESC
+    """).fetchall()
+    conn.close()
+    if not prod:
+        return base_layout("错误", "<h1>生产编号不存在</h1>", user)
+
+    template_rows = "".join(f"""
+      <label class="template-check-row">
+        <input type="checkbox" name="template_ids" value="{t["id"]}">
+        <span><b>{h(t["template_name"])}</b> / {h(t["template_version"])} / {h(t["data_source_type"])} / {t["metric_count"]} 个指标</span>
+      </label>
+    """ for t in templates)
+    if not template_rows:
+        template_rows = '<p class="note">暂无模板，请先到模板库创建。</p>'
+
+    bulk_controls = """
+      <div class="actions" style="margin:8px 0 10px">
+        <button type="button" class="secondary" onclick="document.querySelectorAll('input[name=template_ids]').forEach(x=>x.checked=true)">全选模板</button>
+        <button type="button" class="secondary" onclick="document.querySelectorAll('input[name=template_ids]').forEach(x=>x.checked=false)">全不选</button>
+      </div>
+    """ if templates else ""
+
+    return base_layout("套用模板", f"""
+    <h1>从模板新增量测项：{h(prod['production_code'])}</h1>
+    <div class="card">
+      <form method="post" action="/template_apply">
+        <input type="hidden" name="production_id" value="{production_id}">
+        <style>
+          .template-check-list{{border:1px solid var(--line);border-radius:12px;padding:10px;max-height:260px;overflow:auto;background:#fff}}
+          .template-check-row{{display:flex;align-items:center;gap:10px;padding:9px 8px;border-bottom:1px solid var(--line);cursor:pointer}}
+          .template-check-row:last-child{{border-bottom:none}}
+          .template-check-row input{{width:auto}}
+        </style>
+        <label>选择模板 *</label>
+        {bulk_controls}
+        <div class="template-check-list">{template_rows}</div>
+        <p class="note">可一次勾选多个模板；每个模板会生成一个量测项。勾选多个模板时，“量测项名称”会作为前缀，例如“Demo - 模板A”。</p>
+        <br>
+        <div class="form-grid">
+          <label>量测项名称/前缀</label><input name="item_name" placeholder="不填则使用模板名；多模板时作为前缀">
+          <label>固定量测工序</label><input name="process_step" placeholder="模板没有工序字段时使用，例如 MEAS_STEP_01">
+          <label>量测执行时间</label><input name="execution_time_text" placeholder="例如 工序完成后 / 每日10:00">
+          <label>量测设备</label><input name="equipment_name" placeholder="例如 TOOL01">
+          <label>实时数据源路径 *</label><input name="data_source_path" required style="min-width:520px" placeholder="例如 \\\\192.168.1.100\\share\\result.csv">
+          <label>抓取频率秒</label><input name="scan_frequency_seconds" value="60" type="number" min="10">
+        </div>
+        <br><button type="submit">套用选中模板并生成量测项</button> <a class="btn secondary" href="/items?production_id={production_id}">返回</a>
+      </form>
+      <p class="note">套用模板会复制模板中的生产编号字段、工序字段和指标字段到当前生产编号下。若模板配置了工序字段，采集时会按同一生产编号下的多道工序逐行入库。</p>
+    </div>
+    """, user)
+
+
+def selected_template_ids_from_form(form):
+    raw_ids = form.get("template_ids", [])
+    if not raw_ids:
+        raw_ids = form.get("template_id", [])
+    result = []
+    seen = set()
+    for value in raw_ids:
+        template_id = safe_int(value)
+        if template_id > 0 and template_id not in seen:
+            result.append(template_id)
+            seen.add(template_id)
+    return result
+
+
+def apply_template_to_production(cur, user, prod, template_id, form_values, total_templates):
+    t = cur.execute("SELECT * FROM template_config WHERE id=?", (template_id,)).fetchone()
+    metrics = cur.execute("SELECT * FROM template_metric_config WHERE template_id=? ORDER BY sort_order,id", (template_id,)).fetchall()
+    if not t:
+        raise ValueError(f"模板不存在：{template_id}")
+    if not metrics:
+        raise ValueError(f"模板 {t['template_name']} 下没有指标，无法套用")
+
+    process_step = form_values["process_step"]
+    template_process_column = (t["process_step_column"] if "process_step_column" in t.keys() else "") or ""
+    template_process_column = template_process_column.strip()
+    if not template_process_column and not process_step:
+        raise ValueError(f"模板 {t['template_name']} 没有工序字段。套用时必须填写固定量测工序。")
+
+    item_name_input = form_values["item_name"]
+    if item_name_input and total_templates > 1:
+        item_name = f"{item_name_input} - {t['template_name']}"
+    else:
+        item_name = item_name_input or t["template_name"]
+
+    cur.execute("""
+        INSERT INTO measurement_item_config (
+            production_id, item_name, process_step, process_step_column, execution_time_text, equipment_name,
+            data_source_type, data_source_path, excel_sheet_name, header_row_index, csv_encoding, delimiter, production_code_column,
+            scan_frequency_seconds, enabled, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+    """, (
+        prod["id"], item_name, process_step, template_process_column, form_values["execution_time_text"], form_values["equipment_name"],
+        t["data_source_type"] or "auto", form_values["data_source_path"], t["excel_sheet_name"] if "excel_sheet_name" in t.keys() else "",
+        t["header_row_index"] if "header_row_index" in t.keys() else 1, t["encoding"] or "auto", t["delimiter"] or ",", t["production_code_column"],
+        form_values["scan_frequency_seconds"], now_str()
+    ))
+    item_id = cur.lastrowid
+
+    for idx, m in enumerate(metrics):
+        cur.execute("""
+            INSERT INTO metric_config (
+                item_id, metric_name, source_column, unit, data_type, target, lsl, usl, lcl, ucl, enabled, sort_order, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        """, (
+            item_id, m["metric_name"], m["source_column"], m["unit"], m["data_type"],
+            m["target"], m["lsl"], m["usl"], m["lcl"], m["ucl"], idx, now_str()
+        ))
+
+    cur.execute("""
+        INSERT INTO template_apply_log (template_id, production_id, production_code, item_id, applied_by, applied_at, detail)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (template_id, prod["id"], prod["production_code"], item_id, user.get("username"), now_str(), f"套用模板 {t['template_name']} 到量测项 {item_name}"))
+    return {"item_id": item_id, "template_id": template_id, "template_name": t["template_name"], "item_name": item_name}
+
+
+def handle_template_apply_bulk(user, form, ip_address):
+    require_permission(user, can_manage_config(user))
+    production_id = safe_int(form.get("production_id", [0])[0])
+    template_ids = selected_template_ids_from_form(form)
+    form_values = {
+        "item_name": form.get("item_name", [""])[0].strip(),
+        "process_step": form.get("process_step", [""])[0].strip(),
+        "execution_time_text": form.get("execution_time_text", [""])[0].strip(),
+        "equipment_name": form.get("equipment_name", [""])[0].strip(),
+        "data_source_path": form.get("data_source_path", [""])[0].strip(),
+        "scan_frequency_seconds": max(10, safe_int(form.get("scan_frequency_seconds", [60])[0], 60)),
+    }
+    if not template_ids:
+        raise ValueError("请至少选择一个模板")
+    if not form_values["data_source_path"]:
+        raise ValueError("实时数据源路径不能为空")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    try:
+        prod = cur.execute("SELECT * FROM production_config WHERE id=?", (production_id,)).fetchone()
+        if not prod:
+            raise ValueError("生产编号不存在")
+        applied = [
+            apply_template_to_production(cur, user, prod, template_id, form_values, len(template_ids))
+            for template_id in template_ids
+        ]
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    item_names = ", ".join(x["item_name"] for x in applied)
+    write_audit(user.get("username"), "APPLY_TEMPLATE", "template_config", ",".join(str(x) for x in template_ids), f"套用 {len(applied)} 个模板到生产编号 {prod['production_code']}，生成量测项 {item_names}", ip_address)
+    return applied
+
+
 def page_about(user):
     return base_layout("说明", f"""
     <h1>说明</h1>
@@ -3142,7 +3307,7 @@ class AppHandler(BaseHTTPRequestHandler):
         elif path == "/template_edit":
             self.send_html(page_template_edit(user, safe_int(q.get("id", [0])[0])))
         elif path == "/template_apply":
-            self.send_html(page_template_apply(user, safe_int(q.get("production_id", [0])[0])))
+            self.send_html(page_template_apply_bulk(user, safe_int(q.get("production_id", [0])[0])))
         elif path == "/results":
             self.send_html(page_results(user, q))
         elif path == "/logs":
@@ -3245,8 +3410,12 @@ class AppHandler(BaseHTTPRequestHandler):
                 status, headers, data = redirect("/templates")
                 self.send_bytes(status, headers, data)
             elif path == "/template_apply":
-                item_id = handle_template_apply(user, form, self.client_address[0])
-                status, headers, data = redirect(f"/metrics?item_id={item_id}")
+                applied_items = handle_template_apply_bulk(user, form, self.client_address[0])
+                if len(applied_items) == 1:
+                    status, headers, data = redirect(f"/metrics?item_id={applied_items[0]['item_id']}")
+                else:
+                    production_id = safe_int(form.get("production_id", [0])[0])
+                    status, headers, data = redirect(f"/items?production_id={production_id}")
                 self.send_bytes(status, headers, data)
             elif path == "/import_config":
                 config_json = form.get("config_json", [""])[0]
