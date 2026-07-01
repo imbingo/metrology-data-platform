@@ -6,10 +6,26 @@
 
 - `metrology_data_platform_v2_4/`: 已用 PyInstaller 打包好的 V2.4 程序，Python 运行时和 Python OCR 依赖已经包含在此目录。
 - `offline_ocr_bundle/tesseract_installer/`: Tesseract-OCR 离线安装程序。
+- `metrology_login_launcher.exe`: 日常登录入口，双击后启动后台服务并打开登录页。
 - `start_metrology_v2_4_exe.ps1`: 产线启动脚本，会先安装或定位 Tesseract，再启动平台并打开浏览器。
 - `test_8023_lan_port.ps1`: 局域网 8023 端口连通性测试脚本，不依赖平台主程序。
 
-## 首次运行
+## 日常登录
+
+首次部署完成后，日常使用直接双击：
+
+```text
+metrology_login_launcher.exe
+```
+
+启动器提供两种模式：
+
+- `仅本机使用`: 只允许服务器电脑本机访问。
+- `局域网服务器模式`: 允许局域网其他电脑访问，登录地址显示为 `http://服务器IP:8023`。
+
+点击 `启动并打开登录页` 后，会自动启动后台服务并打开登录页。
+
+## 首次运行/安装 OCR
 
 在 PowerShell 中进入解压后的目录，运行：
 

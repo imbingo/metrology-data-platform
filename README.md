@@ -59,6 +59,14 @@ $env:MDCP_TESSERACT_CMD="C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 若产线电脑不能联网，推荐使用产线 EXE 离线包：
 
+日常登录可直接双击：
+
+```text
+metrology_login_launcher.exe
+```
+
+首次部署或需要安装 OCR 依赖时，运行：
+
 ```powershell
 .\start_metrology_v2_4_exe.ps1
 ```

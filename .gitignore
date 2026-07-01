@@ -28,7 +28,9 @@ exports/
 
 # Local build caches
 build_pyinstaller/
+build_launcher/
 release_staging/
 dist_exe/
+dist_launcher/
 offline_ocr_bundle/
 .env.ocr.ps1
